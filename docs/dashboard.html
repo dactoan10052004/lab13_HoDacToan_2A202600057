@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Day 13 — Observability Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #1e1e2e;
+      color: #cdd6f4;
+      font-family: 'Consolas', 'Monaco', monospace;
+      min-height: 100vh;
+      padding: 16px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+      padding: 12px 16px;
+      background: #181825;
+      border-radius: 8px;
+      border-left: 4px solid #89b4fa;
+    }
+    header h1 { font-size: 1.1rem; color: #89b4fa; }
+    #status { font-size: 0.8rem; }
+    .status-ok  { color: #a6e3a1; }
+    .status-err { color: #f38ba8; }
+    #last-update { font-size: 0.75rem; color: #6c7086; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+    @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+    .panel {
+      background: #181825;
+      border-radius: 8px;
+      padding: 12px;
+      border: 1px solid #313244;
+      position: relative;
+    }
+    .panel-title {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #6c7086;
+      margin-bottom: 8px;
+    }
+    .panel canvas { max-height: 180px; }
+    .slo-badge {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      font-size: 0.65rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    .slo-ok  { background: #1e3a2f; color: #a6e3a1; }
+    .slo-warn { background: #3a2020; color: #f38ba8; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>⬡ Day 13 Observability Lab — Live Dashboard</h1>
+  <span id="status">⏳ Connecting to http://127.0.0.1:8000…</span>
+  <span id="last-update">—</span>
+</header>
+
+<div class="grid">
+  <!-- Panel 1: Latency -->
+  <div class="panel">
+    <div class="panel-title">① Latency P50 / P95 / P99 (ms)</div>
+    <span id="badge-latency" class="slo-badge slo-ok">SLO &lt;3000ms</span>
+    <canvas id="chart-latency"></canvas>
+  </div>
+
+  <!-- Panel 2: Traffic -->
+  <div class="panel">
+    <div class="panel-title">② Traffic — Requests / interval</div>
+    <canvas id="chart-traffic"></canvas>
+  </div>
+
+  <!-- Panel 3: Error Rate -->
+  <div class="panel">
+    <div class="panel-title">③ Error Rate (%) — SLO &lt;2%</div>
+    <span id="badge-error" class="slo-badge slo-ok">SLO &lt;2%</span>
+    <canvas id="chart-error"></canvas>
+  </div>
+
+  <!-- Panel 4: Cost -->
+  <div class="panel">
+    <div class="panel-title">④ Cost (USD) — avg per request</div>
+    <canvas id="chart-cost"></canvas>
+  </div>
+
+  <!-- Panel 5: Tokens -->
+  <div class="panel">
+    <div class="panel-title">⑤ Tokens In / Out (per interval)</div>
+    <canvas id="chart-tokens"></canvas>
+  </div>
+
+  <!-- Panel 6: Quality -->
+  <div class="panel">
+    <div class="panel-title">⑥ Quality Score — SLO &gt;0.75</div>
+    <span id="badge-quality" class="slo-badge slo-ok">SLO &gt;0.75</span>
+    <canvas id="chart-quality"></canvas>
+  </div>
+</div>
+
+<script>
+// ── Config ─────────────────────────────────────────────────────────────────
+const METRICS_URL   = 'http://127.0.0.1:8000/metrics';
+const REFRESH_MS    = 15000;   // 15 seconds
+const MAX_POINTS    = 60;      // 15 min history at 15s intervals
+const SLO_LATENCY   = 3000;   // ms
+const SLO_ERROR     = 2;      // %
+const SLO_QUALITY   = 0.75;
+
+// ── Colour palette (Catppuccin Mocha) ──────────────────────────────────────
+const C = {
+  blue:   '#89b4fa', sky:    '#89dceb', teal:   '#94e2d5',
+  green:  '#a6e3a1', yellow: '#f9e2af', peach:  '#fab387',
+  red:    '#f38ba8', mauve:  '#cba6f7', pink:   '#f5c2e7',
+  text:   '#cdd6f4', subtext:'#a6adc8', overlay:'#6c7086',
+  base:   '#1e1e2e', mantle: '#181825', crust:  '#11111b',
+  slo:    'rgba(243,139,168,0.55)',
+};
+
+const GRID   = { color: 'rgba(108,112,134,0.25)' };
+const TICK   = { color: C.overlay, font: { size: 10 } };
+const LEGEND = { labels: { color: C.subtext, font: { size: 10 }, boxWidth: 10 } };
+
+// ── State ───────────────────────────────────────────────────────────────────
+const labels   = [];
+let prevSnap   = null;
+
+const ts = {
+  p50:[], p95:[], p99:[],
+  traffic:[],
+  errorRate:[],
+  avgCost:[],
+  tokensIn:[], tokensOut:[],
+  quality:[],
+};
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+const sloLine = (val, label) => ({
+  label,
+  data: Array(MAX_POINTS).fill(val),
+  borderColor: C.slo,
+  borderDash: [5, 4],
+  borderWidth: 1.5,
+  pointRadius: 0,
+  fill: false,
+  tension: 0,
+});
+
+function push(arr, val) {
+  arr.push(val);
+  if (arr.length > MAX_POINTS) arr.shift();
+}
+
+function makeChart(id, datasets, yLabel, yMin) {
+  return new Chart(document.getElementById(id), {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      animation: false,
+      responsive: true,
+      maintainAspectRatio: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: LEGEND },
+      scales: {
+        x: { ticks: { ...TICK, maxTicksLimit: 6, maxRotation: 0 }, grid: GRID },
+        y: {
+          ticks: TICK, grid: GRID,
+          title: { display: true, text: yLabel, color: C.overlay, font: { size: 10 } },
+          min: yMin ?? undefined,
+        },
+      },
+    },
+  });
+}
+
+function lineDs(label, arr, color) {
+  return {
+    label, data: arr,
+    borderColor: color, backgroundColor: color + '22',
+    borderWidth: 2, pointRadius: 2, tension: 0.3, fill: false,
+  };
+}
+
+function barDs(label, arr, color) {
+  return {
+    label, data: arr, type: 'bar',
+    backgroundColor: color + '88', borderColor: color,
+    borderWidth: 1,
+  };
+}
+
+// ── Build charts ────────────────────────────────────────────────────────────
+const charts = {
+  latency: makeChart('chart-latency',
+    [lineDs('P50', ts.p50, C.green),
+     lineDs('P95', ts.p95, C.yellow),
+     lineDs('P99', ts.p99, C.peach),
+     sloLine(SLO_LATENCY, 'SLO 3000ms')],
+    'ms', 0),
+
+  traffic: makeChart('chart-traffic',
+    [barDs('Requests', ts.traffic, C.blue)],
+    'count', 0),
+
+  error: makeChart('chart-error',
+    [lineDs('Error Rate', ts.errorRate, C.red),
+     sloLine(SLO_ERROR, 'SLO 2%')],
+    '%', 0),
+
+  cost: makeChart('chart-cost',
+    [lineDs('Avg Cost/req', ts.avgCost, C.mauve)],
+    'USD', 0),
+
+  tokens: makeChart('chart-tokens',
+    [barDs('Tokens In',  ts.tokensIn,  C.sky),
+     barDs('Tokens Out', ts.tokensOut, C.pink)],
+    'tokens', 0),
+
+  quality: makeChart('chart-quality',
+    [lineDs('Quality Avg', ts.quality, C.teal),
+     sloLine(SLO_QUALITY, 'SLO 0.75')],
+    'score', 0),
+};
+
+// ── Fetch & update ───────────────────────────────────────────────────────────
+async function fetchAndUpdate() {
+  let snap;
+  try {
+    const r = await fetch(METRICS_URL, { cache: 'no-store' });
+    snap = await r.json();
+    document.getElementById('status').textContent = '● Live';
+    document.getElementById('status').className = 'status-ok';
+  } catch (e) {
+    document.getElementById('status').textContent = '✗ Cannot reach ' + METRICS_URL;
+    document.getElementById('status').className = 'status-err';
+    return;
+  }
+
+  const now = new Date().toLocaleTimeString();
+  document.getElementById('last-update').textContent = 'Last update: ' + now;
+
+  // Compute deltas from previous snapshot
+  const prev = prevSnap ?? snap;
+  const dTraffic    = Math.max(0, snap.traffic - prev.traffic);
+  const dTokensIn   = Math.max(0, snap.tokens_in_total  - prev.tokens_in_total);
+  const dTokensOut  = Math.max(0, snap.tokens_out_total - prev.tokens_out_total);
+  const prevErrors  = Object.values(prev.error_breakdown).reduce((a,b)=>a+b, 0);
+  const currErrors  = Object.values(snap.error_breakdown).reduce((a,b)=>a+b, 0);
+  const dErrors     = Math.max(0, currErrors - prevErrors);
+  const errorRate   = dTraffic > 0 ? +((dErrors / dTraffic) * 100).toFixed(2) : 0;
+
+  // Push to time series
+  push(labels, now);
+  push(ts.p50,       snap.latency_p50);
+  push(ts.p95,       snap.latency_p95);
+  push(ts.p99,       snap.latency_p99);
+  push(ts.traffic,   dTraffic);
+  push(ts.errorRate, errorRate);
+  push(ts.avgCost,   snap.avg_cost_usd);
+  push(ts.tokensIn,  dTokensIn);
+  push(ts.tokensOut, dTokensOut);
+  push(ts.quality,   snap.quality_avg);
+
+  // Pad SLO line datasets to match labels length
+  Object.values(charts).forEach(ch => {
+    ch.data.datasets.forEach(ds => {
+      if (ds.borderDash) ds.data = Array(labels.length).fill(ds.data[0]);
+    });
+    ch.update('none');
+  });
+
+  // Update SLO badges
+  setBadge('badge-latency', snap.latency_p95 <= SLO_LATENCY);
+  setBadge('badge-error',   errorRate <= SLO_ERROR);
+  setBadge('badge-quality', snap.quality_avg >= SLO_QUALITY);
+
+  prevSnap = snap;
+}
+
+function setBadge(id, ok) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.className = 'slo-badge ' + (ok ? 'slo-ok' : 'slo-warn');
+}
+
+// ── Start ────────────────────────────────────────────────────────────────────
+fetchAndUpdate();
+setInterval(fetchAndUpdate, 15000);
+</script>
+</body>
+</html>
