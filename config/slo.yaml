@@ -4,13 +4,16 @@ slis:
   latency_p95_ms:
     objective: 3000
     target: 99.5
-    note: Replace with your group's target
+    current_value: 780
   error_rate_pct:
     objective: 2
     target: 99.0
+    current_value: 0
   daily_cost_usd:
     objective: 2.5
     target: 100.0
+    current_value: 0.05
   quality_score_avg:
     objective: 0.75
     target: 95.0
+    current_value: 0.8
